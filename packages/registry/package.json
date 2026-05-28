@@ -1,0 +1,16 @@
+{
+  "name": "@agent-mesh/registry",
+  "version": "0.1.0",
+  "description": "Redis agent registry with owner-chain DAG traversal",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@agent-mesh/envelope": "*",
+    "ioredis": "^5.6.1"
+  }
+}

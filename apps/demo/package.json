@@ -1,0 +1,16 @@
+{
+  "name": "@agent-mesh/demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "3-agent demo: planner → executor (fails) → escalates to human",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@agent-mesh/envelope": "*",
+    "@agent-mesh/transport": "*",
+    "@agent-mesh/registry": "*",
+    "zod": "^4.4.3"
+  }
+}
