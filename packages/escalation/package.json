@@ -1,7 +1,7 @@
 {
   "name": "@agent-mesh/escalation",
   "version": "0.1.0",
-  "description": "Owner-chain DAG traversal and escalation state machine",
+  "description": "xstate escalation FSM for agent-mesh",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@agent-mesh/envelope": "*"
+    "@agent-mesh/envelope": "*",
+    "@agent-mesh/registry": "*",
+    "xstate": "^5.19.2"
   }
 }
