@@ -1,0 +1,19 @@
+{
+  "name": "@agent-mesh/transport",
+  "version": "0.1.0",
+  "description": "NATS JetStream transport adapter for agent-mesh",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@agent-mesh/envelope": "*",
+    "@nats-io/jetstream": "^3.0.0",
+    "@nats-io/kv": "^3.0.0",
+    "@nats-io/nats-core": "^3.0.0",
+    "@nats-io/transport-node": "^3.0.0"
+  }
+}

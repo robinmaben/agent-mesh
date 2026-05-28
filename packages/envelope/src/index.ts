@@ -1,101 +1,77 @@
 import { z } from "zod";
 
-// ─── Enum schemas ────────────────────────────────────────────────────────────
+export const PROTOCOL_VERSION = "1.1.0";
 
-export const MessageType = z.enum([
-  "TASK",
-  "QUERY",
-  "RESULT",
-  "ESCALATE",
-  "PING",
-  "ALERT",
-]);
-
+export const MessageType = z.enum(["TASK", "QUERY", "RESULT", "ESCALATE", "PING", "ALERT"]);
 export const Priority = z.enum(["LOW", "NORMAL", "HIGH", "URGENT"]);
-
-export const Visibility = z.enum([
-  "PRIVATE",
-  "OWNER_ONLY",
-  "NETWORK",
-  "PUBLIC",
-]);
-
+export const Visibility = z.enum(["PRIVATE", "OWNER_ONLY", "NETWORK", "PUBLIC"]);
+export const TrustLevel = z.enum(["NONE", "LOW", "MED", "HIGH", "CRITICAL"]);
 export const Severity = z.enum(["INFO", "WARN", "ERROR", "CRITICAL"]);
 
-// ─── Address schemas ─────────────────────────────────────────────────────────
-
-/** agent_id, "owner", "broadcast", or "human:{user_id}" */
-export const Address = z.union([
-  z.string().regex(/^agent:[a-zA-Z0-9_-]+$/, "must be agent:{id}"),
-  z.literal("owner"),
-  z.literal("broadcast"),
-  z.string().regex(/^human:[a-zA-Z0-9_@.-]+$/, "must be human:{user_id}"),
-]);
-
-// ─── Core envelope ───────────────────────────────────────────────────────────
+// DID-format agent/human addresses
+// did:agent:{network}:{org}:{id}  or  did:human:{network}:{org}:{id}
+const DID = z.string().regex(/^did:(agent|human):[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+$/);
+const Address = z.union([DID, z.literal("owner"), z.literal("broadcast")]);
 
 export const AgentMessage = z.object({
-  /** Unique message ID (UUIDv4) */
-  id: z.string().uuid(),
+  protocol_version: z.literal(PROTOCOL_VERSION).default(PROTOCOL_VERSION),
 
-  /** Sender agent ID */
-  from: z.string().regex(/^agent:[a-zA-Z0-9_-]+$/),
+  // Identity + tracing
+  id: z.string().uuid(),           // UUIDv7 in production
+  trace_id: z.string(),            // spans the full request chain
+  parent_id: z.string().uuid().nullable().default(null),
 
-  /** Target address: agent_id | "owner" | "broadcast" | "human:{user_id}" */
+  from: DID,
   to: Address,
 
-  /** Message type */
-  type: MessageType,
+  // Routing config
+  routing: z.object({
+    type: z.enum(["DIRECT", "BROADCAST", "OWNER"]),
+    reply_to: z.string().optional(),   // NATS inbox subject for ACK
+    ttl_seconds: z.number().int().positive(),
+    requires_ack: z.boolean(),
+  }),
 
-  /** Delivery priority */
-  priority: Priority,
+  // Message semantics
+  metadata: z.object({
+    type: MessageType,
+    priority: Priority,
+    timestamp: z.string().datetime(),
+    visibility: Visibility,
+    trust_level_claimed: TrustLevel,
+    severity: Severity.optional(),
+  }),
 
-  /**
-   * Encrypted payload — base64-encoded AES-256-GCM ciphertext.
-   * For NETWORK/PUBLIC visibility, encrypted with stream-level shared key.
-   * For PRIVATE/OWNER_ONLY, encrypted with recipient's public key via ECDH.
-   */
-  payload: z.string().base64(),
+  // Crypto provenance (omitted in dev mode)
+  security: z.object({
+    encryption_mode: z.enum(["ECDH_CHACHA20_POLY1305", "PLAINTEXT"]),
+    sender_public_key: z.string(),
+    owner_chain_jwt: z.string().optional(), // signed delegation chain
+  }).optional(),
 
-  /** Message TTL in seconds. 0 = no expiry. */
-  ttl: z.number().int().nonnegative(),
+  // Encrypted blob (or plaintext in dev mode)
+  payload: z.string(),
 
-  /** Whether the sender expects an explicit ACK from the recipient */
-  requires_ack: z.boolean(),
-
-  /** Who can see this message */
-  visibility: Visibility,
-
-  /** ISO8601 send timestamp */
-  timestamp: z.string().datetime(),
-
-  // ─── Extension fields ───────────────────────────────────────────────────
-
-  /** How many times delivery has been attempted */
+  // Set by transport layer
   retry_count: z.number().int().nonnegative().default(0),
-
-  /**
-   * Resolved ownership chain at send time — [root_agent, ..., direct_owner]
-   * Populated by the transport layer via registry DAG traversal.
-   */
   owner_chain: z.array(z.string()).default([]),
-
-  /** Links a RESULT or ESCALATE back to its originating TASK/QUERY */
-  correlation_id: z.string().uuid().optional(),
-
-  /** For ALERT messages — severity level */
-  severity: Severity.optional(),
-
-  /** Arbitrary metadata (not encrypted, visible to transport layer) */
-  meta: z.record(z.string(), z.unknown()).optional(),
 });
 
 export type AgentMessage = z.infer<typeof AgentMessage>;
 export type MessageType = z.infer<typeof MessageType>;
 export type Priority = z.infer<typeof Priority>;
-export type Visibility = z.infer<typeof Visibility>;
-export type Severity = z.infer<typeof Severity>;
-export type Address = z.infer<typeof Address>;
+export type TrustLevel = z.infer<typeof TrustLevel>;
+
+// Registry node — used by escalation DAG traversal
+export interface DAGNode {
+  id: string;         // DID
+  type: "AGENT" | "HUMAN";
+  status: "ACTIVE" | "UNREACHABLE" | "QUARANTINED";
+  parent?: string;    // parent DID
+  trust_level: z.infer<typeof TrustLevel>;
+  capabilities: string[];
+  last_seen: number;  // unix ms
+}
 
 // ─── ACK envelope ────────────────────────────────────────────────────────────
 
