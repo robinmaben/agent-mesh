@@ -1,21 +1,20 @@
 services:
   nats:
     image: nats:2.10-alpine
-    command: ["--js", "--sd", "/data"]
+    command: ["-js", "-m", "8222"]
     ports:
-      - "4222:4222"   # client connections
-      - "8222:8222"   # HTTP monitoring
+      - "4222:4222"
+      - "8222:8222"
     volumes:
-      - nats_data:/data
+      - nats-data:/data
 
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - redis-data:/data
 
 volumes:
-  nats_data:
-  redis_data:
+  nats-data:
+  redis-data:

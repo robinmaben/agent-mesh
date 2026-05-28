@@ -1,121 +1,196 @@
-import type { DAGNode } from "@agent-mesh/envelope";
+import { createMachine, assign, fromPromise } from "xstate";
+import type { AgentMessage } from "@agent-mesh/envelope";
+import type { AgentRegistry } from "@agent-mesh/registry";
 
-export const FAIL_SAFE = {
-  PARTITION_ISOLATION: "PARTITION_ISOLATION", // >60s offline → freeze + 503
-  DEAD_LETTER: "DEAD_LETTER",                 // all routes exhausted → DLQ
-  BREAK_GLASS: "BREAK_GLASS",                 // signed master key → cluster halt
-} as const;
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface EscalationContext {
-  nodes: Map<string, DAGNode>;
-  dlq: Array<{ message: unknown; reason: string; ts: number }>;
+  message: AgentMessage;
+  agentId: string;
+  retryCount: number;
   maxRetries: number;
-  /** Called when a node needs to receive a message. Returns true if delivered. */
-  deliver: (targetId: string, message: unknown) => Promise<boolean>;
-  /** Out-of-band alert (SMS, PagerDuty) — independent of NATS/Redis */
-  alertOOB: (payload: unknown) => Promise<void>;
+  ownerDid: string | null;
+  rootHumanDid: string | null;
+  error: string | null;
 }
 
-/**
- * Walk the ownership DAG upward from `startId`.
- * Returns the first ACTIVE node encountered, or null if none found.
- * Cycle-safe via visited set.
- */
-export async function resolveOwner(
-  startId: string,
-  ctx: EscalationContext
-): Promise<string | null> {
-  const visited = new Set<string>();
-  let cursor: string | undefined = startId;
+export type EscalationEvent =
+  | { type: "RETRY" }
+  | { type: "FAIL"; error: string }
+  | { type: "ESCALATE_EXPLICIT" }         // message type = ESCALATE
+  | { type: "TIMEOUT" }                    // ack_timeout exceeded
+  | { type: "OWNER_DEAD" }                 // owner TTL expired
+  | { type: "CRITICAL_ALERT" }             // severity=CRITICAL
+  | { type: "ACK_RECEIVED" }
+  | { type: "OWNER_RESOLVED"; ownerDid: string; rootHumanDid: string };
 
-  while (cursor) {
-    if (visited.has(cursor)) {
-      // Cycle detected — bail out
-      await panic(ctx, { from: startId }, `Cycle at node: ${cursor}`);
-      return null;
+export type EscalationState =
+  | "idle"
+  | "resolving_owner"
+  | "pending"
+  | "retrying"
+  | "escalated_agent"
+  | "escalated_human"
+  | "escalated_all_humans"
+  | "dead_letter"
+  | "done";
+
+// ─── Callbacks the machine calls out to ──────────────────────────────────────
+
+export interface EscalationHandlers {
+  onRetry: (ctx: EscalationContext) => Promise<void>;
+  onEscalateToAgent: (ctx: EscalationContext, targetDid: string) => Promise<void>;
+  onEscalateToHuman: (ctx: EscalationContext, humanDid: string) => Promise<void>;
+  onEscalateToAllHumans: (ctx: EscalationContext) => Promise<void>;
+  onDeadLetter: (ctx: EscalationContext) => Promise<void>;
+}
+
+// ─── Factory ─────────────────────────────────────────────────────────────────
+
+export function createEscalationMachine(
+  initial: Pick<EscalationContext, "message" | "agentId" | "maxRetries">,
+  registry: AgentRegistry,
+  handlers: EscalationHandlers
+) {
+  return createMachine(
+    {
+      id: "escalation",
+      types: {} as {
+        context: EscalationContext;
+        events: EscalationEvent;
+      },
+
+      context: {
+        ...initial,
+        retryCount: initial.message.retry_count ?? 0,
+        ownerDid: null,
+        rootHumanDid: null,
+        error: null,
+      },
+
+      initial: "resolving_owner",
+
+      states: {
+        // ── Resolve owner chain before doing anything ──────────────────────
+        resolving_owner: {
+          invoke: {
+            src: fromPromise(async ({ input }: { input: EscalationContext }) => {
+              const ownerDid = await registry.resolveOwner(input.agentId);
+              const chain = await registry.ownerChain(input.agentId);
+              const rootHumanDid = chain.find(id => id.startsWith("did:human:")) ?? null;
+              return { ownerDid, rootHumanDid };
+            }),
+            input: ({ context }) => context,
+            onDone: {
+              target: "pending",
+              actions: assign({
+                ownerDid: ({ event }) => (event as any).output.ownerDid,
+                rootHumanDid: ({ event }) => (event as any).output.rootHumanDid,
+              }),
+            },
+            onError: {
+              target: "dead_letter",
+              actions: assign({ error: ({ event }) => String((event as any).error) }),
+            },
+          },
+        },
+
+        // ── Waiting for outcome ────────────────────────────────────────────
+        pending: {
+          on: {
+            ACK_RECEIVED: "done",
+            FAIL: {
+              actions: assign({
+                retryCount: ({ context }) => context.retryCount + 1,
+                error: ({ event }) => (event as EscalationEvent & { type: "FAIL" }).error,
+              }),
+              target: "retrying",
+            },
+            ESCALATE_EXPLICIT: "escalated_agent",
+            TIMEOUT: "escalated_human",
+            OWNER_DEAD: "escalated_human",
+            CRITICAL_ALERT: "escalated_all_humans",
+          },
+        },
+
+        // ── Retry with backoff ─────────────────────────────────────────────
+        retrying: {
+          always: [
+            { guard: "maxRetriesExceeded", target: "escalated_human" },
+          ],
+          invoke: {
+            src: fromPromise(async ({ input }: { input: EscalationContext }) => {
+              const delay = Math.min(1000 * 2 ** input.retryCount, 30_000);
+              await new Promise(r => setTimeout(r, delay));
+              await handlers.onRetry(input);
+            }),
+            input: ({ context }) => context,
+            onDone: "pending",
+            onError: {
+              target: "dead_letter",
+              actions: assign({ error: ({ event }) => String((event as any).error) }),
+            },
+          },
+        },
+
+        // ── Escalate to direct owner agent ────────────────────────────────
+        escalated_agent: {
+          invoke: {
+            src: fromPromise(async ({ input }: { input: EscalationContext }) => {
+              const target = input.ownerDid;
+              if (!target) throw new Error("No owner to escalate to");
+              await handlers.onEscalateToAgent(input, target);
+            }),
+            input: ({ context }) => context,
+            onDone: "done",
+            onError: "escalated_human", // if owner agent unreachable, go to human
+          },
+        },
+
+        // ── Escalate to human owner ───────────────────────────────────────
+        escalated_human: {
+          invoke: {
+            src: fromPromise(async ({ input }: { input: EscalationContext }) => {
+              const human = input.rootHumanDid;
+              if (!human) throw new Error("No human in owner chain");
+              await handlers.onEscalateToHuman(input, human);
+            }),
+            input: ({ context }) => context,
+            onDone: "done",
+            onError: "dead_letter",
+          },
+        },
+
+        // ── Broadcast to ALL humans (CRITICAL severity) ───────────────────
+        escalated_all_humans: {
+          invoke: {
+            src: fromPromise(async ({ input }: { input: EscalationContext }) => {
+              await handlers.onEscalateToAllHumans(input);
+            }),
+            input: ({ context }) => context,
+            onDone: "done",
+            onError: "dead_letter",
+          },
+        },
+
+        // ── Dead letter — nothing worked ──────────────────────────────────
+        dead_letter: {
+          invoke: {
+            src: fromPromise(async ({ input }: { input: EscalationContext }) => {
+              await handlers.onDeadLetter(input);
+            }),
+            input: ({ context }) => context,
+            onDone: "done",
+          },
+        },
+
+        done: { type: "final" },
+      },
+    },
+    {
+      guards: {
+        maxRetriesExceeded: ({ context }) => context.retryCount >= context.maxRetries,
+      },
     }
-    visited.add(cursor);
-
-    const node = ctx.nodes.get(cursor);
-    if (!node) {
-      await panic(ctx, { from: startId }, `Unregistered node: ${cursor}`);
-      return null;
-    }
-
-    const parent = node.parent;
-    if (!parent) break; // reached root with no human found
-
-    const parentNode = ctx.nodes.get(parent);
-    if (!parentNode) {
-      await panic(ctx, { from: startId }, `Broken parent pointer: ${parent}`);
-      return null;
-    }
-
-    if (parentNode.status === "ACTIVE") return parent;
-
-    cursor = parent; // node unreachable — keep walking up
-  }
-
-  return null;
-}
-
-/**
- * Find the highest human authority in the network.
- * Used as last-resort before dead-letter.
- */
-export function findRootHuman(
-  startId: string,
-  nodes: Map<string, DAGNode>
-): string | null {
-  let cursor: string | undefined = startId;
-  let lastHuman: string | null = null;
-
-  while (cursor) {
-    const node = nodes.get(cursor);
-    if (!node) break;
-    if (node.type === "HUMAN") lastHuman = cursor;
-    cursor = node.parent;
-  }
-
-  return lastHuman;
-}
-
-/**
- * Main escalation entry point.
- * Tries: direct owner → walk DAG → root human → dead letter
- */
-export async function escalate(
-  agentId: string,
-  message: unknown,
-  ctx: EscalationContext
-): Promise<void> {
-  // 1. Try direct owner
-  const owner = await resolveOwner(agentId, ctx);
-  if (owner) {
-    const delivered = await ctx.deliver(owner, message);
-    if (delivered) return;
-  }
-
-  // 2. Try root human
-  const root = findRootHuman(agentId, ctx.nodes);
-  if (root) {
-    const delivered = await ctx.deliver(root, message);
-    if (delivered) return;
-  }
-
-  // 3. All routes exhausted → dead letter
-  await panic(ctx, message, "All escalation paths exhausted");
-}
-
-async function panic(
-  ctx: EscalationContext,
-  message: unknown,
-  reason: string
-): Promise<void> {
-  const entry = { message, reason, ts: Date.now() };
-  ctx.dlq.push(entry);
-  await ctx.alertOOB(entry).catch(() => {
-    // OOB alert must never throw — log silently
-    console.error("[agent-mesh] OOB alert failed:", reason);
-  });
+  );
 }
